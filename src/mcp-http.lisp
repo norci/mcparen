@@ -440,24 +440,29 @@ returned values. The default calls the thunk without adding a scope."
 
 (-> mcp-http--body-octets (t &key (:content-length (or null integer)))
     (simple-array (unsigned-byte 8) (*)))
+(defun mcp-http--body-octet-stream (body)
+  "Return BODY's octet stream together with the encoding that decodes it."
+  (if (typep body 'dexador.decoding-stream:decoding-stream)
+      (values (dexador.decoding-stream::decoding-stream-stream body)
+              (dexador.decoding-stream::decoding-stream-encoding body))
+      (values body :utf-8)))
+
 (defun mcp-http--body-octets (stream &key content-length)
   "Read STREAM's octets, treating a TLS close without close_notify as end of input.
 Signal a protocol error when fewer octets arrive than CONTENT-LENGTH declares."
-  (let ((octets (make-array 8192
-                            :element-type '(unsigned-byte 8)
-                            :adjustable   t
-                            :fill-pointer 0))
-        (buffer (make-array 8192 :element-type '(unsigned-byte 8))))
-    (loop
-      for count = (handler-case (read-sequence buffer stream)
-                    (cl+ssl::ssl-error (condition)
-                      (if (mcp-http--unclean-eof-p condition)
-                          0
-                          (error condition))))
-      while (plusp count)
-      do (loop for index below count
-               do (vector-push-extend (aref buffer index) octets 8192)))
-    (when (and content-length
+    (let ((octets (make-array 8192
+                              :element-type '(unsigned-byte 8)
+                              :adjustable   t
+                              :fill-pointer 0)))
+      (loop
+        for octet = (handler-case (read-byte stream nil nil)
+                      (cl+ssl::ssl-error (condition)
+                        (if (mcp-http--unclean-eof-p condition)
+                            nil
+                            (error condition))))
+        while octet
+        do (vector-push-extend octet octets 8192))
+      (when (and content-length
                (/= content-length (length octets)))
       (error 'mcp-protocol-error
              :message (format nil
@@ -511,12 +516,15 @@ Signal a protocol error when fewer octets arrive than CONTENT-LENGTH declares."
          (mcp-message-too-large-error source limit))
        body)
       ((streamp body)
-       (let ((text (babel:octets-to-string
-                    (mcp-http--body-octets body :content-length content-length)
-                    :encoding :utf-8)))
-         (when (> (length text) limit)
-           (mcp-message-too-large-error source limit))
-         text))
+       (multiple-value-bind (octet-stream encoding)
+           (mcp-http--body-octet-stream body)
+         (let ((text (babel:octets-to-string
+                      (mcp-http--body-octets octet-stream
+                                             :content-length content-length)
+                      :encoding encoding)))
+           (when (> (length text) limit)
+             (mcp-message-too-large-error source limit))
+           text)))
       (t
        (error 'mcp-protocol-error
               :message "The MCP HTTP response body is not readable."

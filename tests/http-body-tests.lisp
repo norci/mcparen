@@ -106,3 +106,26 @@
     (multiple-value-bind (line eof) (mcp-http--read-octet-line stream 100 "test")
       (test-equal nil line)
       (test-equal t eof))))
+
+(defclass test-torn-body-stream (test-body-stream) ())
+
+(defmethod trivial-gray-streams:stream-read-sequence
+    ((stream test-torn-body-stream) buffer start end &key)
+    (let* ((position (test-body-stream-position stream))
+        (octets   (test-body-stream-octets stream))
+        (count    (min (- end start) (- (length octets) position))))
+    (replace buffer octets
+             :start1 start :end1 (+ start count)
+             :start2 position :end2 (+ position count))
+    (setf (test-body-stream-position stream) (+ position count))
+    (when (test-body-stream-unclean stream)
+      (setf (test-body-stream-unclean stream) nil)
+      (error (test-unclean-condition (test-body-stream-error-text stream))))
+    (+ start count)))
+
+(define-test http-body-keeps-octets-read-before-unclean-close
+  (let* ((octets (test-body-octets "{\"jsonrpc\":\"2.0\",\"id\":1}"))
+         (stream (make-instance 'test-torn-body-stream :octets octets :unclean t)))
+    (test-equal octets
+                (mcp-http--body-octets stream :content-length (length octets))
+                :test #'equalp)))
