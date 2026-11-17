@@ -33,7 +33,19 @@
       ((test-body-stream-unclean stream)
        (setf (test-body-stream-unclean stream) nil)
        (error (test-unclean-condition (test-body-stream-error-text stream))))
-      (t end))))
+        (t start))))
+
+(defmethod sb-gray:stream-read-byte ((stream test-body-stream))
+  (let ((position (test-body-stream-position stream))
+        (octets   (test-body-stream-octets stream)))
+    (cond
+      ((< position (length octets))
+       (setf (test-body-stream-position stream) (1+ position))
+       (aref octets position))
+      ((test-body-stream-unclean stream)
+       (setf (test-body-stream-unclean stream) nil)
+       (error (test-unclean-condition (test-body-stream-error-text stream))))
+      (t :eof))))
 
 (defun test-body-octets (text)
   (babel:string-to-octets text :encoding :utf-8))
@@ -83,3 +95,14 @@
         (mcp-http--body-octet-stream decoding)
       (test-assert (eq octet-stream stream) "the decoding stream must be unwrapped")
       (test-assert encoding "the decoding encoding must be returned"))))
+
+(define-test http-body-reads-octet-line-past-unclean-close
+  (let ((stream (make-instance 'test-body-stream
+                               :octets (babel:string-to-octets "data: a" :encoding :utf-8)
+                               :unclean t)))
+    (multiple-value-bind (line eof) (mcp-http--read-octet-line stream 100 "test")
+      (test-equal "data: a" line)
+      (test-equal t eof))
+    (multiple-value-bind (line eof) (mcp-http--read-octet-line stream 100 "test")
+      (test-equal nil line)
+      (test-equal t eof))))

@@ -430,13 +430,6 @@ returned values. The default calls the thunk without adding a scope."
          (and (not (null (search "unexpected eof" text)))
               (not (null (search "while reading" text)))))))
 
-(-> mcp-http--body-octet-stream (t) (values stream t))
-(defun mcp-http--body-octet-stream (body)
-  "Return BODY's octet stream together with the encoding that decodes it."
-  (if (typep body 'dexador.decoding-stream:decoding-stream)
-      (values (dexador.decoding-stream::decoding-stream-stream body)
-              (dexador.decoding-stream::decoding-stream-encoding body))
-      (values body :utf-8)))
 
 (-> mcp-http--content-length (t) (or null integer))
 (defun mcp-http--content-length (headers)
@@ -474,6 +467,34 @@ Signal a protocol error when fewer octets arrive than CONTENT-LENGTH declares."
              :method  nil
              :payload nil))
     (coerce octets '(simple-array (unsigned-byte 8) (*)))))
+(defun mcp-http--read-octet-line (stream limit source)
+  "Read one LF-terminated line of octets, treating a TLS close without close_notify as end of input."
+  (let ((octets        (make-array 128
+                                   :element-type '(unsigned-byte 8)
+                                   :adjustable   t
+                                   :fill-pointer 0))
+        (end-of-file-p nil))
+    (loop
+      for octet = (handler-case (read-byte stream nil nil)
+                    (cl+ssl::ssl-error (condition)
+                      (if (mcp-http--unclean-eof-p condition)
+                          nil
+                          (error condition))))
+      do (cond
+           ((null octet)
+            (setf end-of-file-p t)
+            (return))
+           ((= octet 10)
+            (return))
+           (t
+            (when (>= (fill-pointer octets) limit)
+              (mcp-message-too-large-error source limit))
+            (vector-push-extend octet octets))))
+    (values (when (plusp (fill-pointer octets))
+              (babel:octets-to-string
+               (coerce octets '(simple-array (unsigned-byte 8) (*)))
+               :encoding :utf-8))
+            end-of-file-p)))
 
 (-> mcp-http--body->string
     (mcp-streamable-http-transport t string
@@ -490,15 +511,12 @@ Signal a protocol error when fewer octets arrive than CONTENT-LENGTH declares."
          (mcp-message-too-large-error source limit))
        body)
       ((streamp body)
-       (multiple-value-bind (octet-stream encoding)
-           (mcp-http--body-octet-stream body)
-         (let ((text (babel:octets-to-string
-                      (mcp-http--body-octets octet-stream
-                                             :content-length content-length)
-                      :encoding encoding)))
-           (when (> (length text) limit)
-             (mcp-message-too-large-error source limit))
-           text)))
+       (let ((text (babel:octets-to-string
+                    (mcp-http--body-octets body :content-length content-length)
+                    :encoding :utf-8)))
+         (when (> (length text) limit)
+           (mcp-message-too-large-error source limit))
+         text))
       (t
        (error 'mcp-protocol-error
               :message "The MCP HTTP response body is not readable."
@@ -637,7 +655,7 @@ protocol checks."
                   (mcp-http-transport-connect-timeout transport))
              :read-timeout  remaining
              :max-redirects 0
-             :force-string  t
+             :force-binary  t
              :keep-alive    nil
              (when message
                (list
@@ -934,7 +952,7 @@ protocol checks."
            :timeout   timeout
            :operation "MCP HTTP request"))
         (multiple-value-bind (raw-line end-of-file-p)
-            (stream-read-bounded-line
+            (mcp-http--read-octet-line
              stream limit "MCP SSE line")
           (when raw-line
             (let ((line (string-right-trim '(#\Return) raw-line)))
@@ -1232,7 +1250,7 @@ protocol checks."
                :connect-timeout connect-timeout
                :read-timeout    nil
                :max-redirects   0
-               :force-string    t
+               :force-binary    t
                :keep-alive      nil))
           (let ((released-p nil))
             (unwind-protect
@@ -1623,7 +1641,7 @@ protocol checks."
                    :read-timeout
                    (mcp-http-transport-connect-timeout transport)
                    :max-redirects 0
-                   :force-string  t
+                   :force-binary  t
                    :keep-alive    nil)))
              (error ()
                nil)))
