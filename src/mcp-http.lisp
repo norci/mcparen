@@ -422,10 +422,64 @@ returned values. The default calls the thunk without adding a scope."
        :cause     nil))
     remaining))
 
+(-> mcp-http--unclean-eof-p (t) boolean)
+(defun mcp-http--unclean-eof-p (condition)
+  "True when CONDITION is the TLS error OpenSSL raises for a peer that closed without sending close_notify, so the bytes already read are the whole body."
+  (and (typep condition 'cl+ssl::ssl-error)
+       (let ((text (princ-to-string condition)))
+         (and (not (null (search "unexpected eof" text)))
+              (not (null (search "while reading" text)))))))
+
+(-> mcp-http--body-octet-stream (t) (values stream t))
+(defun mcp-http--body-octet-stream (body)
+  "Return BODY's octet stream together with the encoding that decodes it."
+  (if (typep body 'dexador.decoding-stream:decoding-stream)
+      (values (dexador.decoding-stream::decoding-stream-stream body)
+              (dexador.decoding-stream::decoding-stream-encoding body))
+      (values body :utf-8)))
+
+(-> mcp-http--content-length (t) (or null integer))
+(defun mcp-http--content-length (headers)
+  "Return HEADERS' declared Content-Length as an integer."
+  (let ((value (mcp-http--header-value headers "Content-Length")))
+    (when value
+      (parse-integer value :junk-allowed t))))
+
+(-> mcp-http--body-octets (t &key (:content-length (or null integer)))
+    (simple-array (unsigned-byte 8) (*)))
+(defun mcp-http--body-octets (stream &key content-length)
+  "Read STREAM's octets, treating a TLS close without close_notify as end of input.
+Signal a protocol error when fewer octets arrive than CONTENT-LENGTH declares."
+  (let ((octets (make-array 8192
+                            :element-type '(unsigned-byte 8)
+                            :adjustable   t
+                            :fill-pointer 0))
+        (buffer (make-array 8192 :element-type '(unsigned-byte 8))))
+    (loop
+      for count = (handler-case (read-sequence buffer stream)
+                    (cl+ssl::ssl-error (condition)
+                      (if (mcp-http--unclean-eof-p condition)
+                          0
+                          (error condition))))
+      while (plusp count)
+      do (loop for index below count
+               do (vector-push-extend (aref buffer index) octets 8192)))
+    (when (and content-length
+               (/= content-length (length octets)))
+      (error 'mcp-protocol-error
+             :message (format nil
+                              "The MCP HTTP response body ended after ~D of ~D declared octets."
+                              (length octets)
+                              content-length)
+             :method  nil
+             :payload nil))
+    (coerce octets '(simple-array (unsigned-byte 8) (*)))))
+
 (-> mcp-http--body->string
-    (mcp-streamable-http-transport t string)
+    (mcp-streamable-http-transport t string
+     &key (:content-length (or null integer)))
     string)
-(defun mcp-http--body->string (transport body source)
+(defun mcp-http--body->string (transport body source &key content-length)
   "Read response BODY within TRANSPORT's configured character limit."
   (let ((limit (mcp-http-transport-maximum-message-characters transport)))
     (cond
@@ -436,7 +490,15 @@ returned values. The default calls the thunk without adding a scope."
          (mcp-message-too-large-error source limit))
        body)
       ((streamp body)
-       (stream-read-bounded-string body limit source))
+       (multiple-value-bind (octet-stream encoding)
+           (mcp-http--body-octet-stream body)
+         (let ((text (babel:octets-to-string
+                      (mcp-http--body-octets octet-stream
+                                             :content-length content-length)
+                      :encoding encoding)))
+           (when (> (length text) limit)
+             (mcp-message-too-large-error source limit))
+           text)))
       (t
        (error 'mcp-protocol-error
               :message "The MCP HTTP response body is not readable."
@@ -661,7 +723,6 @@ protocol checks."
        :deadline  deadline
        :timeout   timeout
        :operation "MCP HTTP server response")
-    (declare (ignore headers))
     (unwind-protect
          (progn
            (unless (= status 202)
@@ -1508,7 +1569,6 @@ protocol checks."
                :deadline  deadline
                :timeout   timeout
                :operation "MCP HTTP notification")
-            (declare (ignore headers))
             (unwind-protect
                  (progn
                    (unless (= status 202)
