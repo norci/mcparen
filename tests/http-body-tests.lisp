@@ -87,15 +87,6 @@
                       (cl+ssl::ssl-error (condition) condition))))
     (test-assert signalled "an SSL error that is not an unclean close must propagate")))
 
-(define-test http-body-unwraps-decoding-stream
-  (let* ((octets (test-body-octets "hi"))
-         (stream (make-instance 'test-body-stream :octets octets))
-         (decoding (dexador.decoding-stream:make-decoding-stream stream :encoding :utf-8)))
-    (multiple-value-bind (octet-stream encoding)
-        (mcp-http--body-octet-stream decoding)
-      (test-assert (eq octet-stream stream) "the decoding stream must be unwrapped")
-      (test-assert encoding "the decoding encoding must be returned"))))
-
 (define-test http-body-reads-octet-line-past-unclean-close
   (let ((stream (make-instance 'test-body-stream
                                :octets (babel:string-to-octets "data: a" :encoding :utf-8)
@@ -129,3 +120,20 @@
     (test-equal octets
                 (mcp-http--body-octets stream :content-length (length octets))
                 :test #'equalp)))
+
+(define-test http-body-bounds-reading-by-the-character-limit
+  (let* ((octets (make-array 400 :element-type '(unsigned-byte 8) :initial-element 32))
+         (stream (make-instance 'test-body-stream :octets octets)))
+    (test-assert (handler-case
+                     (progn (mcp-http--body-octets stream :source "test" :limit 10) nil)
+                   (error () t))
+                 "a body past four octets per character must be rejected while reading")
+    (test-assert (<= (test-body-stream-position stream) 41)
+                 "reading must stop at the ceiling, not at the end of the body")))
+
+(define-test http-body-rejects-malformed-content-length
+  (let ((condition (handler-case
+                       (progn (mcp-http--content-length '(("content-length" . "12abc"))) nil)
+                     (mcp-protocol-error (signalled) signalled))))
+    (test-assert condition "a malformed Content-Length must signal mcp-protocol-error")))
+
